@@ -85,6 +85,9 @@ BaseSimpleCPU::BaseSimpleCPU(const BaseSimpleCPUParams &p)
       curThread(0),
       branchPred(p.branchPred),
       traceData(NULL),
+      branchTraceEnable(p.branch_trace_enable),
+      branchTraceStream(nullptr),
+      lastInstAddr(0),
       _status(Idle)
 {
     SimpleThread *thread;
@@ -116,6 +119,12 @@ BaseSimpleCPU::BaseSimpleCPU(const BaseSimpleCPUParams &p)
                 cpu_tc, this->checker);
     } else {
         checker = NULL;
+    }
+
+    if (branchTraceEnable) {
+        const std::string fname = csprintf(
+            "branch_trace_core_%d.log", cpuId());
+        branchTraceStream = simout.findOrCreate(fname)->stream();
     }
 }
 
@@ -356,6 +365,7 @@ BaseSimpleCPU::preExecute()
     // decode the instruction
     set(preExecuteTempPC, thread->pcState());
     auto &pc_state = *preExecuteTempPC;
+    lastInstAddr = pc_state.instAddr();
 
     auto &decoder = thread->decoder;
 
@@ -451,6 +461,10 @@ BaseSimpleCPU::postExecute()
 
     if (curStaticInst->isControl()) {
         ++fetchStats[t_info.thread->threadId()]->numBranches;
+        if (branchTraceEnable && branchTraceStream) {
+            ccprintf(*branchTraceStream, "%llu\n",
+                     static_cast<unsigned long long>(lastInstAddr));
+        }
     }
 
     /* Power model statistics */

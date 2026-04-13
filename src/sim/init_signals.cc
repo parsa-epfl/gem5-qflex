@@ -48,6 +48,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <memory>
 
 #if defined(__FreeBSD__)
 #include <sys/param.h>

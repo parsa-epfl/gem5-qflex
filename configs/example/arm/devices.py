@@ -129,6 +129,8 @@ class ArmCpuCluster(CpuCluster):
                 cpu.tracer = TarmacTracer()
                 if tarmac_dest is not None:
                     cpu.tracer.outfile = tarmac_dest
+            if hasattr(cpu, "branch_trace_enable"):
+                cpu.branch_trace_enable = True
 
         system.addCpuCluster(self)
 

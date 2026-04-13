@@ -43,7 +43,10 @@
 #define __CPU_SIMPLE_BASE_HH__
 
 #include <memory>
+#include <ostream>
 
+#include "base/output.hh"
+#include "base/types.hh"
 #include "arch/generic/pcstate.hh"
 #include "base/statistics.hh"
 #include "cpu/base.hh"
@@ -85,6 +88,10 @@ class BaseSimpleCPU : public BaseCPU
   protected:
     ThreadID curThread;
     branch_prediction::BPredUnit *branchPred;
+
+    bool branchTraceEnable;
+    std::ostream *branchTraceStream;
+    Addr lastInstAddr;
 
     void checkPcEventQueue();
     void swapActiveThread();

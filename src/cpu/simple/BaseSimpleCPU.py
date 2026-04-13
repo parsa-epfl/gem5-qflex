@@ -38,3 +38,4 @@ class BaseSimpleCPU(BaseCPU):
     cxx_class = "gem5::BaseSimpleCPU"
 
     branchPred = Param.BranchPredictor(NULL, "Branch Predictor")
+    branch_trace_enable = Param.Bool(False, "Enable branch trace logging")
