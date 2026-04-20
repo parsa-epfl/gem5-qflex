@@ -523,6 +523,33 @@ class Pl011(Uart):
         yield node
 
 
+class QFlexPl011(Pl011):
+    """Pl011 variant for QFlex platforms.
+
+    Overrides generateDeviceTree to use a single FixedClock (24MHz)
+    instead of VExpress-specific mcc/dcc oscillators.
+    """
+
+    def generateDeviceTree(self, state):
+        node = self.generateBasicPioDeviceNode(
+            state, "uart", self.pio_addr, 0x1000, [self.interrupt]
+        )
+        node.appendCompatible(["arm,pl011", "arm,primecell"])
+
+        platform = self._parent.unproxy(self)
+        node.append(
+            FdtPropertyWords(
+                "clocks",
+                [
+                    state.phandle(platform.fixed_clock24MHz),
+                    state.phandle(platform.fixed_clock24MHz),
+                ],
+            )
+        )
+        node.append(FdtPropertyStrings("clock-names", ["uartclk", "apb_pclk"]))
+        yield node
+
+
 class Sp804(AmbaPioDevice):
     type = "Sp804"
     cxx_header = "dev/arm/timer_sp804.hh"
@@ -1767,3 +1794,394 @@ class VExpress_GEM5_Foundation(VExpress_GEM5_Base):
         if boot_loader is None:
             boot_loader = [loc("boot_foundation.arm64")]
         super().setupBootLoader(cur_sys, boot_loader)
+
+
+# =============================================================================
+# QFlex QEMU-Compatible Platforms
+# =============================================================================
+#
+# ARM platforms for QFlex that exactly match QEMU virt memory map.
+# This allows using QEMU device trees and bootloaders directly in gem5.
+#
+# Hierarchy:
+#   RealView
+#     └── QFlex_Virt_Base       (QEMU virt clone: uart, rtc, pci, vio, flash)
+#           └── QFlex_GICv3     (GICv3 - matches QEMU default)
+#
+# Key differences from VExpress:
+#   - DRAM at 0x40000000 (1GB) instead of 0x80000000 (2GB)
+#   - UART at 0x09000000 instead of 0x1C090000
+#   - RTC at 0x09010000 instead of 0x1C170000
+#   - VirtIO at 0x0a000000 instead of 0x1C130000
+#   - GICv3 at 0x08000000 instead of 0x2F000000
+#   - Flash at 0x00000000 (128MB) for bootloader
+#   - PCI addresses match QEMU virt layout
+#
+# Compatible with: QEMU virt device trees, QEMU_EFI.fd bootloader
+# Result: Identical memory layout to QEMU for cross-simulator compatibility
+
+
+class QFlex_Virt_Base(RealView):
+    """
+    Configurable ARM platform for QFlex.
+
+    Default memory map matches QEMU virt machine (v9.0+).
+    Can be reconfigured by passing a memmap dict during construction:
+
+        # Load JSON externally and pass as dict:
+        import json
+        with open("memmap.json") as f:
+            cfg = json.load(f)
+        platform = QFlex_GICv3(memmap=cfg)
+
+        # Or pass dict directly:
+        platform = QFlex_GICv3(memmap={
+            "dram": {"base": 0x40000000, "max_size": "8GiB"},
+            "uart": {"base": 0x09000000, "irq": 1},
+            ...
+        })
+
+    Generate a memmap JSON from a DTS file:
+        python3 QPoints/scripts/yaml_to_memmap.py virt.yaml -o memmap.json
+
+    Default memory map (QEMU virt):
+        0x00000000: Flash/bootmem (128MiB)
+        0x08000000: GIC (set by V1/V2 subclass)
+        0x09000000: UART0/PL011
+        0x09010000: RTC/PL031
+        0x0a000000: VirtIO MMIO
+        0x10000000: PCI MMIO low
+        0x3eff0000: PCI IO
+        0x40000000: DRAM start
+        0x4010000000: PCI ECAM config
+
+    Default interrupts (QEMU virt):
+        SPI 1:     UART
+        SPI 2:     RTC
+        SPI 3-6:   PCI (4 legacy INTx lines)
+        SPI 16-47: VirtIO (32 devices)
+        PPI 19-30: ARM architectural timer
+
+    
+    """
+
+    # --- Default values (QEMU virt) ---
+
+    # DRAM starts at 1GiB (QEMU virt standard)
+    _mem_regions = [AddrRange("1GiB", size="255GiB")]
+
+    # Bridge ranges for off-chip device access (QEMU virt layout)
+    _off_chip_ranges = [
+        # Low peripherals: GIC, UART, RTC, fw-cfg, VirtIO, platform-bus
+        AddrRange(0x08000000, 0x0E000000),
+        # PCI MMIO low and PCI IO
+        AddrRange(0x10000000, 0x40000000),
+    ]
+
+    # Flash/Boot memory at address 0 (128MB: 2x 64MB banks for UEFI)
+    bootmem = SimpleMemory(
+        range=AddrRange(0, size="128MiB"), conf_table_reported=False
+    )
+
+    # 24MHz fixed clock (QEMU virt apb-pclk) and voltage domain
+    io_voltage = VoltageDomain(voltage="3.3V")
+    fixed_clock24MHz = FixedClock(clock="24MHz")
+
+    # System counter and architectural timer (required for ARM)
+    sys_counter = SystemCounter()
+    generic_timer = GenericTimer(
+        int_el3_phys=ArmPPI(num=29, int_type="IRQ_TYPE_LEVEL_HIGH"),
+        int_el1_phys=ArmPPI(num=30, int_type="IRQ_TYPE_LEVEL_HIGH"),
+        int_el1_virt=ArmPPI(num=27, int_type="IRQ_TYPE_LEVEL_HIGH"),
+        int_el2_ns_phys=ArmPPI(num=26, int_type="IRQ_TYPE_LEVEL_HIGH"),
+        int_el2_ns_virt=ArmPPI(num=28, int_type="IRQ_TYPE_LEVEL_HIGH"),
+        int_el2_s_phys=ArmPPI(num=20, int_type="IRQ_TYPE_LEVEL_HIGH"),
+        int_el2_s_virt=ArmPPI(num=19, int_type="IRQ_TYPE_LEVEL_HIGH"),
+    )
+
+    # Single UART for console (ttyAMA0) - QEMU virt address
+    uart = [
+        QFlexPl011(pio_addr=0x09000000, interrupt=ArmSPI(num=33)),
+    ]
+    # Real-time clock - QEMU virt address
+    rtc = PL031(pio_addr=0x09010000, interrupt=ArmSPI(num=34))
+
+    # PCI host controller and bus - QEMU virt addresses
+    pci_host = GenericArmPciHost(
+        conf_base=0x4010000000,  # ECAM config space (high memory)
+        conf_size="256MiB",
+        conf_device_bits=12,
+        pci_pio_base=0x3EFF0000,  # 64KB IO space
+        pci_mem_base=0x10000000,  # MMIO low (~750MB)
+        int_policy="ARM_PCI_INT_DEV",
+        int_base=35,  # QEMU virt SPIs 3-6 encoded as gem5 IRQs 35-38
+        int_count=4,
+    )
+    pci_bus = PciBus()
+
+    # VirtIO MMIO devices - QEMU virt base address (32 slots available)
+    vio = [
+        MmioVirtIO(
+            pio_addr=0x0A000000, pio_size=0x200,
+            interrupt=ArmSPI(num=48, int_type="IRQ_TYPE_EDGE_RISING"),
+        ),
+    ]
+
+    def __init__(self, **kwargs):
+        memmap = kwargs.pop("memmap", None)
+        super().__init__(**kwargs)
+        self.fixed_clock24MHz.voltage_domain = self.io_voltage
+        if memmap is not None:
+            self._apply_memmap(memmap)
+
+    # -----------------------------------------------------------------
+    # memmap internals
+    # -----------------------------------------------------------------
+
+    @staticmethod
+    def _parse_addr(val):
+        """Parse an address from hex string or int."""
+        if isinstance(val, str):
+            return int(val, 0)
+        return int(val)
+
+    @staticmethod
+    def _spi_num_to_gem5(irq):
+        """Normalize a SPI ID from DT format to gem5 internal numbering.
+
+        DT uses SPI IDs starting at 0. gem5 ArmSPI uses GIC IRQ numbers
+        where SPIs start at 32.
+        """
+        irq = int(irq)
+        return irq + 32 if irq < 32 else irq
+
+    def _validate_memmap(self, cfg):
+        """Validate required fields and parseable addresses."""
+        required_top = ["bootmem", "dram", "uart"]
+        for field in required_top:
+            if field not in cfg:
+                raise ValueError(
+                    f"memmap missing required section: '{field}'"
+                )
+
+        required_keys = {
+            "bootmem": ["base", "size"],
+            "dram": ["base", "max_size"],
+            "uart": ["base", "irq"],
+        }
+        for section, keys in required_keys.items():
+            if section not in cfg:
+                continue
+            for key in keys:
+                if key not in cfg[section]:
+                    raise ValueError(
+                        f"memmap['{section}'] missing required key: '{key}'"
+                    )
+
+        # Validate hex strings are parseable
+        for path, val in [
+            ("bootmem.base", cfg["bootmem"]["base"]),
+            ("dram.base", cfg["dram"]["base"]),
+            ("uart.base", cfg["uart"]["base"]),
+        ]:
+            try:
+                self._parse_addr(val)
+            except (ValueError, TypeError):
+                raise ValueError(f"Invalid address in memmap['{path}']: {val}")
+
+        # DRAM must not overlap bootmem
+        dram_base = self._parse_addr(cfg["dram"]["base"])
+        boot_base = self._parse_addr(cfg["bootmem"]["base"])
+        if dram_base <= boot_base:
+            raise ValueError(
+                f"DRAM base (0x{dram_base:x}) must be above "
+                f"bootmem base (0x{boot_base:x})"
+            )
+
+    def _apply_memmap(self, cfg):
+        """Apply a memory map configuration to this platform.
+
+        Args:
+            cfg (dict): Memory map configuration dictionary.
+
+        Overrides only the sections present in the configuration;
+        missing sections keep their class-level defaults.
+        """
+        self._validate_memmap(cfg)
+        pa = self._parse_addr  # shorthand
+
+        # --- Bootmem / Flash ---
+        if "bootmem" in cfg:
+            self.bootmem.range = AddrRange(
+                pa(cfg["bootmem"]["base"]), size=cfg["bootmem"]["size"]
+            )
+
+        # --- DRAM ---
+        if "dram" in cfg:
+            self._mem_regions = [
+                AddrRange(pa(cfg["dram"]["base"]),
+                          size=cfg["dram"]["max_size"])
+            ]
+
+        # --- UART ---
+        if "uart" in cfg:
+            self.uart[0].pio_addr = pa(cfg["uart"]["base"])
+            self.uart[0].interrupt = ArmSPI(
+                num=self._spi_num_to_gem5(cfg["uart"]["irq"])
+            )
+
+        # --- RTC ---
+        if "rtc" in cfg:
+            self.rtc.pio_addr = pa(cfg["rtc"]["base"])
+            self.rtc.interrupt = ArmSPI(
+                num=self._spi_num_to_gem5(cfg["rtc"]["irq"])
+            )
+
+        # --- VirtIO MMIO ---
+        if "virtio" in cfg and cfg["virtio"]:
+            v = cfg["virtio"][0]
+            self.vio[0].pio_addr = pa(v["base"])
+            if "size" in v:
+                self.vio[0].pio_size = pa(v["size"])
+            self.vio[0].interrupt = ArmSPI(
+                num=self._spi_num_to_gem5(v["irq"]),
+                int_type="IRQ_TYPE_EDGE_RISING",
+            )
+
+        # --- PCI ---
+        if "pci" in cfg:
+            p = cfg["pci"]
+            if "ecam_base" in p:
+                self.pci_host.conf_base = pa(p["ecam_base"])
+            if "ecam_size" in p:
+                self.pci_host.conf_size = p["ecam_size"]
+            if "pio_base" in p:
+                self.pci_host.pci_pio_base = pa(p["pio_base"])
+            if "mmio_base" in p:
+                self.pci_host.pci_mem_base = pa(p["mmio_base"])
+            if "int_base" in p:
+                self.pci_host.int_base = self._spi_num_to_gem5(p["int_base"])
+            if "int_count" in p:
+                self.pci_host.int_count = p["int_count"]
+
+        # --- GIC (only if subclass defines one) ---
+        if "gic" in cfg and hasattr(self, "gic"):
+            g = cfg["gic"]
+            if "dist_addr" in g:
+                self.gic.dist_addr = pa(g["dist_addr"])
+            if "redist_addr" in g and hasattr(self.gic, "redist_addr"):
+                self.gic.redist_addr = pa(g["redist_addr"])
+            if "its_addr" in g and hasattr(self.gic, "its"):
+                self.gic.its.pio_addr = pa(g["its_addr"])
+            if "cpu_addr" in g and hasattr(self.gic, "cpu_addr"):
+                self.gic.cpu_addr = pa(g["cpu_addr"])
+            if "cpu_max" in g:
+                self.gic.cpu_max = g["cpu_max"]
+
+        # --- Bridge ranges ---
+        if "bridge_ranges" in cfg:
+            self._off_chip_ranges = [
+                AddrRange(pa(r[0]), pa(r[1])) for r in cfg["bridge_ranges"]
+            ]
+
+        # --- Boot offsets (used by setupBootLoader) ---
+        if "boot" in cfg:
+            b = cfg["boot"]
+            if "dtb_offset" in b:
+                self._boot_dtb_offset = pa(b["dtb_offset"])
+            if "load_offset" in b:
+                self._boot_load_offset = pa(b["load_offset"])
+
+    # -----------------------------------------------------------------
+
+    def _on_chip_devices(self):
+        return []
+
+    def _on_chip_memory(self):
+        return [self.bootmem]
+
+    def _off_chip_devices(self):
+        return self.uart + [self.rtc, self.vio[0], self.fixed_clock24MHz]
+
+    def _off_chip_memory(self):
+        return []
+
+    def _attach_pci(self, devices, bus, dma_ports=None):
+        self.pci_bus.cpu_side_ports = self.pci_host.down_request_port()
+        self.pci_bus.default = self.pci_host.down_response_port()
+        self.pci_bus.config_error_port = self.pci_host.config_error.pio
+
+        bus.mem_side_ports = self.pci_host.up_response_port()
+        if dma_ports is None:
+            bus.cpu_side_ports = self.pci_host.up_request_port()
+        else:
+            dma_ports.append(self.pci_host.up_request_port())
+
+        for d in devices:
+            self._attach_pci_device(d, self.pci_host, self.pci_bus)
+
+    def attachPciDevice(self, device):
+        self._num_pci_dev += 1
+        device.pci_dev = self._num_pci_dev
+        device.pci_func = 0
+        self._attach_pci_device(device, self.pci_host, self.pci_bus)
+
+    def setupBootLoader(self, cur_sys, boot_loader):
+        dtb_off = getattr(self, "_boot_dtb_offset", 0x8000000)
+        load_off = getattr(self, "_boot_load_offset", 0x40000000)
+        super().setupBootLoader(cur_sys, boot_loader, dtb_off, load_off)
+        cur_sys.m5ops_base = 0x10010000
+
+    def generateDeviceTree(self, state):
+        dt = list(super().generateDeviceTree(state))
+        if len(dt) > 1:
+            raise Exception("System returned too many DT nodes")
+        node = dt[0]
+
+        node.appendCompatible(["qflex,virt"])
+        node.append(FdtPropertyStrings("model", ["QFlex-Virt"]))
+
+        system = self.system.unproxy(self)
+        if system._have_psci:
+            if not system.release.has(ArmExtension("SECURITY")):
+                raise AssertionError("PSCI requires EL3 (have_security)")
+
+            psci_node = FdtNode("psci")
+            psci_node.appendCompatible(
+                ["arm,psci-1.0", "arm,psci-0.2", "arm,psci"]
+            )
+            method = "smc"
+            psci_node.append(FdtPropertyStrings("method", method))
+            psci_node.append(FdtPropertyWords("cpu_suspend", 0xC4000001))
+            psci_node.append(FdtPropertyWords("cpu_off", 0x84000002))
+            psci_node.append(FdtPropertyWords("cpu_on", 0xC4000003))
+            psci_node.append(FdtPropertyWords("sys_poweroff", 0x84000008))
+            psci_node.append(FdtPropertyWords("sys_reset", 0x84000009))
+            node.append(psci_node)
+
+        yield node
+
+
+class QFlex_GICv3(QFlex_Virt_Base):
+    """
+    QFlex platform with GICv3 - EXACT QEMU virt clone.
+    Uses QEMU virt GIC addresses for full compatibility.
+    """
+
+    gic = Gicv3(
+        dist_addr=0x08000000,     # QEMU virt GICv3 distributor
+        redist_addr=0x080A0000,   # QEMU virt GICv3 redistributor
+        maint_int=ArmPPI(num=25),
+        gicv4=False,  # QEMU virt uses GICv3, not v4
+        its=Gicv3Its(pio_addr=0x08080000),  # QEMU virt ITS address
+    )
+    gic.cpu_max = 123
+
+    def _on_chip_devices(self):
+        return super()._on_chip_devices() + [self.gic, self.gic.its]
+
+    def setupBootLoader(self, cur_sys, loc, boot_loader=None):
+        if boot_loader is None:
+            boot_loader = [loc("boot_v2.arm64")]
+        super().setupBootLoader(cur_sys, boot_loader)
+

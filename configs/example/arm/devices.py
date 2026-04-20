@@ -106,6 +106,7 @@ class ArmCpuCluster(CpuCluster):
         l1i_type,
         l1d_type,
         l2_type,
+        max_insts=None,
         tarmac_gen=False,
         tarmac_dest=None,
     ):
@@ -125,6 +126,10 @@ class ArmCpuCluster(CpuCluster):
         self.generate_cpus(cpu_type, num_cpus)
 
         for cpu in self.cpus:
+            # Set max_insts if specified
+            if max_insts is not None:
+                cpu.max_insts_any_thread = max_insts
+
             if tarmac_gen:
                 cpu.tracer = TarmacTracer()
                 if tarmac_dest is not None:
@@ -217,6 +222,7 @@ class AtomicCluster(ArmCpuCluster):
         num_cpus,
         cpu_clock,
         cpu_voltage="1.0V",
+        max_insts=None,
         tarmac_gen=False,
         tarmac_dest=None,
     ):
@@ -229,6 +235,7 @@ class AtomicCluster(ArmCpuCluster):
             l1i_type=None,
             l1d_type=None,
             l2_type=None,
+            max_insts=max_insts,
             tarmac_gen=tarmac_gen,
             tarmac_dest=tarmac_dest,
         )
@@ -244,6 +251,7 @@ class KvmCluster(ArmCpuCluster):
         num_cpus,
         cpu_clock,
         cpu_voltage="1.0V",
+        max_insts=None,
         tarmac_gen=False,
         tarmac_dest=None,
     ):
@@ -256,6 +264,7 @@ class KvmCluster(ArmCpuCluster):
             l1i_type=None,
             l1d_type=None,
             l2_type=None,
+            max_insts=max_insts,
             tarmac_gen=tarmac_gen,
             tarmac_dest=tarmac_dest,
         )

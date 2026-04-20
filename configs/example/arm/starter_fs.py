@@ -138,6 +138,7 @@ def create(args):
             args.cpu_freq,
             "1.0V",
             *cpu_types[args.cpu],
+            max_insts=args.max_insts,
             tarmac_gen=args.tarmac_gen,
             tarmac_dest=args.tarmac_dest,
         )
@@ -256,6 +257,13 @@ def main():
     parser.add_argument("--cpu-freq", type=str, default="4GHz")
     parser.add_argument(
         "--num-cores", type=int, default=1, help="Number of CPU cores"
+    )
+    parser.add_argument(
+        "-I",
+        "--max-insts",
+        type=int,
+        default=None,
+        help="Maximum number of instructions to execute on any thread",
     )
     parser.add_argument(
         "--mem-type",

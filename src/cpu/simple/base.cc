@@ -84,10 +84,10 @@ BaseSimpleCPU::BaseSimpleCPU(const BaseSimpleCPUParams &p)
     : BaseCPU(p),
       curThread(0),
       branchPred(p.branchPred),
-      traceData(NULL),
       branchTraceEnable(p.branch_trace_enable),
       branchTraceStream(nullptr),
       lastInstAddr(0),
+      traceData(NULL),
       _status(Idle)
 {
     SimpleThread *thread;
