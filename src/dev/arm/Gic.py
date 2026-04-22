@@ -315,6 +315,12 @@ class Gicv3(BaseGic):
         "redistributors",
     )
 
+    redist_is_stride = Param.Bool(
+        True,
+        "True  = emit 'redistributor-stride' in DTB (gem5 native style). "
+        "False = emit '#redistributor-regions' instead (QEMU virt style).",
+    )
+
     gicv4 = Param.Bool(False, "GIC is GICv4 compatible")
 
     reserved_is_res0 = Param.Bool(
@@ -350,17 +356,25 @@ class Gicv3(BaseGic):
         node.append(FdtProperty("interrupt-controller"))
 
         redist_stride = 0x40000 if self.gicv4 else 0x20000
-        node.append(
-            FdtPropertyWords(
-                "redistributor-stride", state.sizeCells(redist_stride)
+
+        if self.redist_is_stride:
+            node.append(
+                FdtPropertyWords(
+                    "redistributor-stride", state.sizeCells(redist_stride)
+                )
             )
-        )
+        else:
+            node.append(
+                FdtPropertyWords(
+                    "#redistributor-regions", [1]
+                )
+            )
 
         regs = (
             state.addrCells(self.dist_addr)
             + state.sizeCells(0x10000)
             + state.addrCells(self.redist_addr)
-            + state.sizeCells(0x2000000)
+            + state.sizeCells(self.cpu_max * redist_stride)
         )
 
         node.append(FdtPropertyWords("reg", regs))

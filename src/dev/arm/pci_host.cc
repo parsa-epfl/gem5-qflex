@@ -66,6 +66,14 @@ GenericArmPciHost::mapPciInterrupt(const PciDevAddr &addr, PciIntPin pin) const
       case enums::ARM_PCI_INT_PIN:
         return intBase + ((static_cast<uint8_t>(pin) - 1) % intCount);
 
+      // Swizzled routing: IRQ rotates by device slot number so adjacent
+      // slots never share an interrupt line.  This matches the QEMU virt
+      // interrupt-map layout (4 slots x 4 INTx pins with rotation).
+      // Formula: irq = intBase + (pin - 1 + dev) % intCount
+      case enums::ARM_PCI_INT_SWIZZLE:
+        return intBase + ((static_cast<uint8_t>(pin) - 1 + addr.dev)
+                          % intCount);
+
       default:
         fatal("Unsupported PCI interrupt routing policy.");
     }

@@ -149,7 +149,8 @@ class A9SCU(BasicPioDevice):
 
 
 class ArmPciIntRouting(Enum):
-    vals = ["ARM_PCI_INT_STATIC", "ARM_PCI_INT_DEV", "ARM_PCI_INT_PIN"]
+    vals = ["ARM_PCI_INT_STATIC", "ARM_PCI_INT_DEV", "ARM_PCI_INT_PIN",
+            "ARM_PCI_INT_SWIZZLE"]
 
 
 class GenericArmPciHost(GenericPciHost):
@@ -159,13 +160,23 @@ class GenericArmPciHost(GenericPciHost):
 
     int_policy = Param.ArmPciIntRouting("PCI interrupt routing policy")
     int_base = Param.Unsigned("PCI interrupt base")
+    int_type = Param.ArmInterruptType(
+        "IRQ_TYPE_EDGE_RISING", "PCI interrupt trigger type"
+    )
     int_count = Param.Unsigned(
         "Maximum number of interrupts used by this host"
     )
 
-    # This python parameter can be used in configuration scripts to turn
-    # on/off the fdt dma-coherent flag when doing dtb autogeneration
-    _dma_coherent = True
+    # Default PIO MMIO32 window size; overridden by QFlex_Virt_Base when memmap
+    # provides an explicit pio_size from the DT ranges entry.
+    _pci_pio_size = 0x10000
+    _pci_mmio32_size = 0x40000000
+
+    # Set by QFlex_Virt_Base from memmap. None means the range is omitted
+    # from the DTB, preserving backward compatibility for platforms that
+    # do not supply these values.
+    _pci_mem64_base = None
+    _pci_mem64_size = None
 
     def generateDeviceTree(self, state):
         local_state = FdtState(
@@ -205,55 +216,92 @@ class GenericArmPciHost(GenericPciHost):
         # Pio address range
         ranges += self.pciFdtAddr(space=1, addr=0)
         ranges += state.addrCells(self.pci_pio_base)
-        ranges += local_state.sizeCells(0x10000)  # Fixed size
+        ranges += local_state.sizeCells(self._pci_pio_size)
 
-        # AXI memory address range
-        ranges += self.pciFdtAddr(space=2, addr=0)
+        # MMIO32 address range
+        ranges += self.pciFdtAddr(space=2, addr=int(self.pci_mem_base))
         ranges += state.addrCells(self.pci_mem_base)
-        ranges += local_state.sizeCells(0x40000000)  # Fixed size
+        ranges += local_state.sizeCells(self._pci_mmio32_size)
+
+        # MMIO64 prefetchable range (omitted when not configured by platform)
+        if self._pci_mem64_base is not None and self._pci_mem64_size is not None:
+            ranges += self.pciFdtAddr(space=3, addr=int(self._pci_mem64_base))
+            ranges += state.addrCells(self._pci_mem64_base)
+            ranges += local_state.sizeCells(self._pci_mem64_size)
+
         node.append(FdtPropertyWords("ranges", ranges))
 
-        if str(self.int_policy) == "ARM_PCI_INT_DEV":
+        if str(self.int_policy) in ("ARM_PCI_INT_DEV", "ARM_PCI_INT_SWIZZLE"):
             gic = self._parent.unproxy(self).gic
             int_phandle = state.phandle(gic)
             # Interrupt mapping
             interrupts = []
 
-            # child interrupt specifier
+            # child interrupt specifier (1 cell: INTx pin number 1-4)
             child_interrupt = local_state.interruptCells(0x0)
 
-            # parent unit address
+            # parent unit address (zeroed for GIC — it has no unit addr)
             parent_addr = gic._state.addrCells(0x0)
-
-            for i in range(int(self.int_count)):
-                parent_interrupt = gic.interruptCells(
-                    0, int(self.int_base) - 32 + i, 1
-                )
-
-                interrupts += (
-                    self.pciFdtAddr(device=i, addr=0)
-                    + child_interrupt
-                    + [int_phandle]
-                    + parent_addr
-                    + parent_interrupt
-                )
-
-            node.append(FdtPropertyWords("interrupt-map", interrupts))
 
             int_count = int(self.int_count)
             if int_count & (int_count - 1):
                 fatal("PCI interrupt count should be power of 2")
 
-            intmask = self.pciFdtAddr(device=int_count - 1, addr=0) + [0x0]
+            if str(self.int_policy) == "ARM_PCI_INT_DEV":
+                # One entry per device slot: all pins on a slot share one IRQ.
+                # interrupt-map-mask only has device bits set (no pin bits).
+                # Formula: irq = int_base + device_slot % int_count
+                for i in range(int_count):
+                    parent_interrupt = gic.interruptCells(
+                        0,
+                        int(self.int_base) - 32 + i,
+                        int(self.int_type.getValue()),
+                    )
+                    interrupts += (
+                        self.pciFdtAddr(device=i, addr=0)
+                        + child_interrupt
+                        + [int_phandle]
+                        + parent_addr
+                        + parent_interrupt
+                    )
+                intmask = self.pciFdtAddr(device=int_count - 1, addr=0) + [0x0]
+
+            else:  # ARM_PCI_INT_SWIZZLE
+                # Full 16-entry swizzled map: 4 device slots × 4 INTx pins.
+                # Each device slot rotates the base IRQ by the slot number so
+                # that adjacent slots never share an IRQ line, spreading
+                # interrupt load across all available lines.
+                # Formula: irq = int_base + (pin - 1 + device_slot) % int_count
+                # interrupt-map-mask has both device bits AND pin bits set,
+                # matching the QEMU virt layout (mask = [0x1800, 0, 0, 0x7]).
+                for dev_slot in range(int_count):
+                    for pin_num in range(1, int_count + 1):  # pins 1-4 (INTA-INTD)
+                        irq_offset = (pin_num - 1 + dev_slot) % int_count
+                        parent_interrupt = gic.interruptCells(
+                            0,
+                            int(self.int_base) - 32 + irq_offset,
+                            int(self.int_type.getValue()),
+                        )
+                        interrupts += (
+                            self.pciFdtAddr(device=dev_slot, addr=0)
+                            + local_state.interruptCells(pin_num)
+                            + [int_phandle]
+                            + parent_addr
+                            + parent_interrupt
+                        )
+                # Mask: device bits (0x1800) + pin bits (0x7)
+                intmask = (
+                    self.pciFdtAddr(device=int_count - 1, addr=0)
+                    + [int_count - 1]
+                )
+
+            node.append(FdtPropertyWords("interrupt-map", interrupts))
             node.append(FdtPropertyWords("interrupt-map-mask", intmask))
         else:
             m5.fatal(
                 "Unsupported PCI interrupt policy "
                 + "for Device Tree generation"
             )
-
-        if self._dma_coherent:
-            node.append(FdtProperty("dma-coherent"))
 
         yield node
 
@@ -638,6 +686,29 @@ class PL031(AmbaIntDevice):
         node.append(FdtPropertyWords("clocks", clock))
         node.append(FdtPropertyStrings("clock-names", ["apb_pclk"]))
 
+        yield node
+
+
+class QFlexPL031(PL031):
+    """PL031 variant for QFlex platforms.
+
+    Overrides generateDeviceTree to use the platform's FixedClock (24MHz)
+    instead of the inherited clk_domain, matching QEMU virt apb-pclk.
+    """
+
+    def generateDeviceTree(self, state):
+        node = self.generateBasicPioDeviceNode(
+            state, "rtc", self.pio_addr, 0x1000, [self.interrupt]
+        )
+        node.appendCompatible(["arm,pl031", "arm,primecell"])
+
+        platform = self._parent.unproxy(self)
+        node.append(
+            FdtPropertyWords(
+                "clocks", [state.phandle(platform.fixed_clock24MHz)]
+            )
+        )
+        node.append(FdtPropertyStrings("clock-names", ["apb_pclk"]))
         yield node
 
 
@@ -1865,29 +1936,10 @@ class QFlex_Virt_Base(RealView):
     
     """
 
-    # --- Default values (QEMU virt) ---
+    # --- Structural components (not address-dependent) ---
 
-    # DRAM starts at 1GiB (QEMU virt standard)
-    _mem_regions = [AddrRange("1GiB", size="255GiB")]
-
-    # Bridge ranges for off-chip device access (QEMU virt layout)
-    _off_chip_ranges = [
-        # Low peripherals: GIC, UART, RTC, fw-cfg, VirtIO, platform-bus
-        AddrRange(0x08000000, 0x0E000000),
-        # PCI MMIO low and PCI IO
-        AddrRange(0x10000000, 0x40000000),
-    ]
-
-    # Flash/Boot memory at address 0 (128MB: 2x 64MB banks for UEFI)
-    bootmem = SimpleMemory(
-        range=AddrRange(0, size="128MiB"), conf_table_reported=False
-    )
-
-    # 24MHz fixed clock (QEMU virt apb-pclk) and voltage domain
     io_voltage = VoltageDomain(voltage="3.3V")
     fixed_clock24MHz = FixedClock(clock="24MHz")
-
-    # System counter and architectural timer (required for ARM)
     sys_counter = SystemCounter()
     generic_timer = GenericTimer(
         int_el3_phys=ArmPPI(num=29, int_type="IRQ_TYPE_LEVEL_HIGH"),
@@ -1898,41 +1950,77 @@ class QFlex_Virt_Base(RealView):
         int_el2_s_phys=ArmPPI(num=20, int_type="IRQ_TYPE_LEVEL_HIGH"),
         int_el2_s_virt=ArmPPI(num=19, int_type="IRQ_TYPE_LEVEL_HIGH"),
     )
-
-    # Single UART for console (ttyAMA0) - QEMU virt address
-    uart = [
-        QFlexPl011(pio_addr=0x09000000, interrupt=ArmSPI(num=33)),
-    ]
-    # Real-time clock - QEMU virt address
-    rtc = PL031(pio_addr=0x09010000, interrupt=ArmSPI(num=34))
-
-    # PCI host controller and bus - QEMU virt addresses
-    pci_host = GenericArmPciHost(
-        conf_base=0x4010000000,  # ECAM config space (high memory)
-        conf_size="256MiB",
-        conf_device_bits=12,
-        pci_pio_base=0x3EFF0000,  # 64KB IO space
-        pci_mem_base=0x10000000,  # MMIO low (~750MB)
-        int_policy="ARM_PCI_INT_DEV",
-        int_base=35,  # QEMU virt SPIs 3-6 encoded as gem5 IRQs 35-38
-        int_count=4,
-    )
     pci_bus = PciBus()
 
-    # VirtIO MMIO devices - QEMU virt base address (32 slots available)
-    vio = [
-        MmioVirtIO(
-            pio_addr=0x0A000000, pio_size=0x200,
-            interrupt=ArmSPI(num=48, int_type="IRQ_TYPE_EDGE_RISING"),
-        ),
-    ]
-
     def __init__(self, **kwargs):
-        memmap = kwargs.pop("memmap", None)
+        memmap = kwargs.pop("memmap")
+        # Validate and parse all values before any SimObject setup
+        self._validate_memmap(memmap)
+        v = self._parse_memmap(memmap)
+
         super().__init__(**kwargs)
         self.fixed_clock24MHz.voltage_domain = self.io_voltage
-        if memmap is not None:
-            self._apply_memmap(memmap)
+
+        # Create components with parsed values
+        self.bootmem = SimpleMemory(
+            range=AddrRange(v["boot_base"], size=v["boot_size"]),
+            conf_table_reported=False,
+        )
+        self._mem_regions = [AddrRange(v["dram_base"], size=v["dram_size"])]
+        self._off_chip_ranges = v["off_chip_ranges"]
+
+        self.uart = [
+            QFlexPl011(
+                pio_addr=v["uart_base"],
+                interrupt=ArmSPI(
+                    num=v["uart_irq"], int_type=v["uart_int_type"]
+                ),
+            )
+        ]
+        self.rtc = QFlexPL031(
+            pio_addr=v["rtc_base"],
+            interrupt=ArmSPI(num=v["rtc_irq"], int_type=v["rtc_int_type"]),
+        )
+        self.vio = [
+            MmioVirtIO(
+                pio_addr=d["base"],
+                pio_size=d["size"],
+                interrupt=ArmSPI(
+                    num=d["irq"],
+                    int_type=d["int_type"],
+                ),
+            )
+            for d in v["vio_devices"]
+        ]
+        self.pci_host = GenericArmPciHost(
+            conf_base=v["pci_ecam_base"],
+            conf_size=v["pci_ecam_size"],
+            conf_device_bits=v["pci_conf_device_bits"],
+            pci_pio_base=v["pci_pio_base"],
+            pci_mem_base=v["pci_mmio_base"],
+            int_policy=v["pci_int_policy"],
+            int_base=v["pci_int_base"],
+            int_type=v["pci_int_type"],
+            int_count=v["pci_int_count"],
+        )
+        self.pci_host._pci_pio_size = v["pci_pio_size"]
+        self.pci_host._pci_mmio32_size = v["pci_mmio32_size"]
+        self.pci_host._pci_mem64_base = v["pci_mmio64_base"]
+        self.pci_host._pci_mem64_size = v["pci_mmio64_size"]
+
+        # GIC (subclass must define self.gic before calling super().__init__)
+        self.gic.dist_addr = v["gic_dist_addr"]
+        self.gic.redist_addr = v["gic_redist_addr"]
+        self.gic.cpu_max = v["gic_cpu_max"]
+        self.gic.redist_is_stride = v["gic_redist_is_stride"]
+        if v["gic_its_addr"] is not None:
+            self.gic.its.pio_addr = v["gic_its_addr"]
+        if v["gic_cpu_addr"] is not None:
+            self.gic.cpu_addr = v["gic_cpu_addr"]
+
+
+        self._boot_dtb_offset = v["boot_dtb_offset"]
+        self._boot_load_offset = v["boot_load_offset"]
 
     # -----------------------------------------------------------------
     # memmap internals
@@ -1946,44 +2034,105 @@ class QFlex_Virt_Base(RealView):
         return int(val)
 
     @staticmethod
-    def _spi_num_to_gem5(irq):
-        """Normalize a SPI ID from DT format to gem5 internal numbering.
+    def _parse_irq_kind(kind):
+        """Parse GIC interrupt kind from DT metadata (SPI/PPI)."""
+        if isinstance(kind, int):
+            if kind == 0:
+                return "SPI"
+            if kind == 1:
+                return "PPI"
+        if isinstance(kind, str):
+            k = kind.strip().upper()
+            if k in ["SPI", "PPI"]:
+                return k
+        raise ValueError(f"Unsupported interrupt kind: {kind}")
 
-        DT uses SPI IDs starting at 0. gem5 ArmSPI uses GIC IRQ numbers
-        where SPIs start at 32.
-        """
+    @staticmethod
+    def _normalize_gic_irq(irq, kind):
+        """Convert DT irq number to gem5 internal GIC numbering."""
         irq = int(irq)
-        return irq + 32 if irq < 32 else irq
+        k = QFlex_Virt_Base._parse_irq_kind(kind)
+        if k == "SPI":
+            return irq + 32
+        if k == "PPI":
+            return irq + 16
+        raise ValueError(f"Unsupported interrupt kind: {kind}")
+
+    @staticmethod
+    def _parse_arm_int_type(int_type):
+        """Parse DT trigger type into gem5 ArmInterruptType enum name."""
+        value_to_name = {
+            0x1: "IRQ_TYPE_EDGE_RISING",
+            0x2: "IRQ_TYPE_EDGE_FALLING",
+            0x4: "IRQ_TYPE_LEVEL_HIGH",
+            0x8: "IRQ_TYPE_LEVEL_LOW",
+        }
+        if isinstance(int_type, int):
+            if int_type in value_to_name:
+                return value_to_name[int_type]
+            raise ValueError(f"Unsupported ArmInterruptType value: {int_type}")
+
+        if isinstance(int_type, str):
+            name = int_type.strip().upper()
+            if name in value_to_name.values():
+                return name
+            raise ValueError(f"Unsupported ArmInterruptType name: {int_type}")
+
+        raise ValueError(f"Unsupported ArmInterruptType: {int_type}")
 
     def _validate_memmap(self, cfg):
-        """Validate required fields and parseable addresses."""
-        required_top = ["bootmem", "dram", "uart"]
-        for field in required_top:
-            if field not in cfg:
-                raise ValueError(
-                    f"memmap missing required section: '{field}'"
-                )
-
+        """Validate all required fields are present and parseable."""
         required_keys = {
             "bootmem": ["base", "size"],
             "dram": ["base", "max_size"],
-            "uart": ["base", "irq"],
+            "uart": ["base", "irq", "irq_type", "int_type"],
+            "rtc": ["base", "irq", "irq_type", "int_type"],
+            "pci": ["ecam_base", "ecam_size", "conf_device_bits",
+                    "pio_base", "pio_size",
+                    "mmio_base", "mmio_size", "mmio64_base",
+                    "mmio64_size", "int_base", "int_irq_type",
+                    "int_type", "int_count", "int_policy"],
+            "gic": ["dist_addr", "redist_addr", "cpu_max"],
+            "boot": ["dtb_offset", "load_offset"],
         }
         for section, keys in required_keys.items():
             if section not in cfg:
-                continue
+                raise ValueError(
+                    f"memmap missing required section: '{section}'"
+                )
             for key in keys:
                 if key not in cfg[section]:
                     raise ValueError(
                         f"memmap['{section}'] missing required key: '{key}'"
                     )
 
+        # VirtIO: must be a non-empty list with base, irq
+        if "virtio" not in cfg or not cfg["virtio"]:
+            raise ValueError("memmap missing required section: 'virtio'")
+        for vkey in ["base", "irq", "irq_type", "int_type"]:
+            if vkey not in cfg["virtio"][0]:
+                raise ValueError(
+                    f"memmap['virtio'][0] missing required key: '{vkey}'"
+                )
+
+        if "bridge_ranges" not in cfg or not cfg["bridge_ranges"]:
+            raise ValueError("memmap missing required section: 'bridge_ranges'")
+
         # Validate hex strings are parseable
-        for path, val in [
+        addr_fields = [
             ("bootmem.base", cfg["bootmem"]["base"]),
             ("dram.base", cfg["dram"]["base"]),
             ("uart.base", cfg["uart"]["base"]),
-        ]:
+            ("rtc.base", cfg["rtc"]["base"]),
+            ("pci.ecam_base", cfg["pci"]["ecam_base"]),
+            ("pci.mmio_base", cfg["pci"]["mmio_base"]),
+            ("pci.mmio64_base", cfg["pci"]["mmio64_base"]),
+            ("pci.pio_base", cfg["pci"]["pio_base"]),
+            ("gic.dist_addr", cfg["gic"]["dist_addr"]),
+            ("boot.dtb_offset", cfg["boot"]["dtb_offset"]),
+            ("boot.load_offset", cfg["boot"]["load_offset"]),
+        ]
+        for path, val in addr_fields:
             try:
                 self._parse_addr(val)
             except (ValueError, TypeError):
@@ -1998,99 +2147,86 @@ class QFlex_Virt_Base(RealView):
                 f"bootmem base (0x{boot_base:x})"
             )
 
-    def _apply_memmap(self, cfg):
-        """Apply a memory map configuration to this platform.
+    def _parse_memmap(self, cfg):
+        """Parse all memmap values into a flat dict.
 
         Args:
-            cfg (dict): Memory map configuration dictionary.
+            cfg (dict): Already validated by _validate_memmap().
 
-        Overrides only the sections present in the configuration;
-        missing sections keep their class-level defaults.
+        Returns:
+            dict with all parsed values ready for component creation.
         """
-        self._validate_memmap(cfg)
-        pa = self._parse_addr  # shorthand
+        pa = self._parse_addr
+        to_gem5 = self._normalize_gic_irq
+        parse_type = self._parse_arm_int_type
 
-        # --- Bootmem / Flash ---
-        if "bootmem" in cfg:
-            self.bootmem.range = AddrRange(
-                pa(cfg["bootmem"]["base"]), size=cfg["bootmem"]["size"]
-            )
+        # Boot memory
+        boot_base = pa(cfg["bootmem"]["base"])
 
-        # --- DRAM ---
-        if "dram" in cfg:
-            self._mem_regions = [
-                AddrRange(pa(cfg["dram"]["base"]),
-                          size=cfg["dram"]["max_size"])
-            ]
+        # DRAM
+        dram_base = pa(cfg["dram"]["base"])
 
-        # --- UART ---
-        if "uart" in cfg:
-            self.uart[0].pio_addr = pa(cfg["uart"]["base"])
-            self.uart[0].interrupt = ArmSPI(
-                num=self._spi_num_to_gem5(cfg["uart"]["irq"])
-            )
-
-        # --- RTC ---
-        if "rtc" in cfg:
-            self.rtc.pio_addr = pa(cfg["rtc"]["base"])
-            self.rtc.interrupt = ArmSPI(
-                num=self._spi_num_to_gem5(cfg["rtc"]["irq"])
-            )
-
-        # --- VirtIO MMIO ---
-        if "virtio" in cfg and cfg["virtio"]:
-            v = cfg["virtio"][0]
-            self.vio[0].pio_addr = pa(v["base"])
-            if "size" in v:
-                self.vio[0].pio_size = pa(v["size"])
-            self.vio[0].interrupt = ArmSPI(
-                num=self._spi_num_to_gem5(v["irq"]),
-                int_type="IRQ_TYPE_EDGE_RISING",
-            )
-
-        # --- PCI ---
-        if "pci" in cfg:
-            p = cfg["pci"]
-            if "ecam_base" in p:
-                self.pci_host.conf_base = pa(p["ecam_base"])
-            if "ecam_size" in p:
-                self.pci_host.conf_size = p["ecam_size"]
-            if "pio_base" in p:
-                self.pci_host.pci_pio_base = pa(p["pio_base"])
-            if "mmio_base" in p:
-                self.pci_host.pci_mem_base = pa(p["mmio_base"])
-            if "int_base" in p:
-                self.pci_host.int_base = self._spi_num_to_gem5(p["int_base"])
-            if "int_count" in p:
-                self.pci_host.int_count = p["int_count"]
-
-        # --- GIC (only if subclass defines one) ---
-        if "gic" in cfg and hasattr(self, "gic"):
-            g = cfg["gic"]
-            if "dist_addr" in g:
-                self.gic.dist_addr = pa(g["dist_addr"])
-            if "redist_addr" in g and hasattr(self.gic, "redist_addr"):
-                self.gic.redist_addr = pa(g["redist_addr"])
-            if "its_addr" in g and hasattr(self.gic, "its"):
-                self.gic.its.pio_addr = pa(g["its_addr"])
-            if "cpu_addr" in g and hasattr(self.gic, "cpu_addr"):
-                self.gic.cpu_addr = pa(g["cpu_addr"])
-            if "cpu_max" in g:
-                self.gic.cpu_max = g["cpu_max"]
-
-        # --- Bridge ranges ---
-        if "bridge_ranges" in cfg:
-            self._off_chip_ranges = [
+        return {
+            # Bootmem
+            "boot_base": boot_base,
+            "boot_size": cfg["bootmem"]["size"],
+            # DRAM
+            "dram_base": dram_base,
+            "dram_size": cfg["dram"]["max_size"],
+            # UART
+            "uart_base": pa(cfg["uart"]["base"]),
+            "uart_irq": to_gem5(cfg["uart"]["irq"], cfg["uart"]["irq_type"]),
+            "uart_int_type": parse_type(cfg["uart"]["int_type"]),
+            # RTC
+            "rtc_base": pa(cfg["rtc"]["base"]),
+            "rtc_irq": to_gem5(cfg["rtc"]["irq"], cfg["rtc"]["irq_type"]),
+            "rtc_int_type": parse_type(cfg["rtc"]["int_type"]),
+            # VirtIO — one entry per device, preserving order from the memmap.
+            "vio_devices": [
+                {
+                    "base":     pa(d["base"]),
+                    "size":     pa(d["size"]) if "size" in d else 0x200,
+                    "irq":      to_gem5(d["irq"], d["irq_type"]),
+                    "int_type": parse_type(d["int_type"]),
+                }
+                for d in cfg["virtio"]
+            ],
+            # PCI
+            "pci_ecam_base": pa(cfg["pci"]["ecam_base"]),
+            "pci_ecam_size": cfg["pci"]["ecam_size"],
+            # conf_device_bits controls the per-function config space slot
+            # size in C++ (1 << conf_device_bits bytes). 12 = ECAM, 8 = CAM.
+            "pci_conf_device_bits": cfg["pci"]["conf_device_bits"],
+            # int_policy selects gem5's interrupt routing strategy.
+            # ARM_PCI_INT_DEV = route by device slot (derived from DT
+            # interrupt-map presence); ARM_PCI_INT_STATIC = no map.
+            "pci_int_policy": cfg["pci"]["int_policy"],
+            "pci_pio_base": pa(cfg["pci"]["pio_base"]),
+            "pci_pio_size": pa(cfg["pci"]["pio_size"]),
+            "pci_mmio_base": pa(cfg["pci"]["mmio_base"]),
+            "pci_mmio32_size": pa(cfg["pci"]["mmio_size"]),
+            "pci_mmio64_base": pa(cfg["pci"]["mmio64_base"]),
+            "pci_mmio64_size": pa(cfg["pci"]["mmio64_size"]),
+            "pci_int_base": to_gem5(
+                cfg["pci"]["int_base"], cfg["pci"]["int_irq_type"]
+            ),
+            "pci_int_type": parse_type(cfg["pci"]["int_type"]),
+            "pci_int_count": cfg["pci"]["int_count"],
+            # GIC
+            "gic_dist_addr": pa(cfg["gic"]["dist_addr"]),
+            "gic_redist_addr": pa(cfg["gic"]["redist_addr"]),
+            "gic_its_addr": pa(cfg["gic"]["its_addr"]) if "its_addr" in cfg["gic"] else None,
+            "gic_cpu_addr": pa(cfg["gic"]["cpu_addr"]) if "cpu_addr" in cfg["gic"] else None,
+            "gic_cpu_max": cfg["gic"]["cpu_max"],
+            "gic_redist_is_stride": cfg["gic"].get("is_stride", True),
+            # Bridge ranges
+            "off_chip_ranges": [
                 AddrRange(pa(r[0]), pa(r[1])) for r in cfg["bridge_ranges"]
-            ]
-
-        # --- Boot offsets (used by setupBootLoader) ---
-        if "boot" in cfg:
-            b = cfg["boot"]
-            if "dtb_offset" in b:
-                self._boot_dtb_offset = pa(b["dtb_offset"])
-            if "load_offset" in b:
-                self._boot_load_offset = pa(b["load_offset"])
+            ],
+            # Boot offsets
+            "boot_dtb_offset": pa(cfg["boot"]["dtb_offset"]),
+            "boot_load_offset": pa(cfg["boot"]["load_offset"]),
+        }
 
     # -----------------------------------------------------------------
 
@@ -2101,7 +2237,7 @@ class QFlex_Virt_Base(RealView):
         return [self.bootmem]
 
     def _off_chip_devices(self):
-        return self.uart + [self.rtc, self.vio[0], self.fixed_clock24MHz]
+        return self.uart + [self.rtc] + self.vio + [self.fixed_clock24MHz]
 
     def _off_chip_memory(self):
         return []
@@ -2127,9 +2263,9 @@ class QFlex_Virt_Base(RealView):
         self._attach_pci_device(device, self.pci_host, self.pci_bus)
 
     def setupBootLoader(self, cur_sys, boot_loader):
-        dtb_off = getattr(self, "_boot_dtb_offset", 0x8000000)
-        load_off = getattr(self, "_boot_load_offset", 0x40000000)
-        super().setupBootLoader(cur_sys, boot_loader, dtb_off, load_off)
+        super().setupBootLoader(
+            cur_sys, boot_loader,
+            self._boot_dtb_offset, self._boot_load_offset)
         cur_sys.m5ops_base = 0x10010000
 
     def generateDeviceTree(self, state):
@@ -2169,13 +2305,12 @@ class QFlex_GICv3(QFlex_Virt_Base):
     """
 
     gic = Gicv3(
-        dist_addr=0x08000000,     # QEMU virt GICv3 distributor
-        redist_addr=0x080A0000,   # QEMU virt GICv3 redistributor
+        dist_addr=0,
+        redist_addr=0,
         maint_int=ArmPPI(num=25),
-        gicv4=False,  # QEMU virt uses GICv3, not v4
-        its=Gicv3Its(pio_addr=0x08080000),  # QEMU virt ITS address
+        gicv4=False,
+        its=Gicv3Its(pio_addr=0),
     )
-    gic.cpu_max = 123
 
     def _on_chip_devices(self):
         return super()._on_chip_devices() + [self.gic, self.gic.its]
@@ -2184,4 +2319,3 @@ class QFlex_GICv3(QFlex_Virt_Base):
         if boot_loader is None:
             boot_loader = [loc("boot_v2.arm64")]
         super().setupBootLoader(cur_sys, boot_loader)
-

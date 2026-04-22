@@ -173,7 +173,7 @@ json_path = os.path.abspath(f"{yaml_base}.memmap.json")
 
 try:
     result = subprocess.run(
-        [python_exe, yaml_to_memmap_script, args.yaml, '-o', json_path],
+        [python_exe, yaml_to_memmap_script, args.yaml, '-o', json_path, '--virtio-devices', '1'],
         capture_output=True,
         text=True,
         check=True
