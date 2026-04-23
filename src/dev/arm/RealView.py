@@ -289,10 +289,16 @@ class GenericArmPciHost(GenericPciHost):
                             + parent_addr
                             + parent_interrupt
                         )
-                # Mask: device bits (0x1800) + pin bits (0x7)
+                # Mask: device bits (0x1800) + pin bits.
+                # Pin values are 1..int_count.  The mask must cover the
+                # highest pin value in binary, so we need bit_length(int_count)
+                # bits.  For int_count=4: bit_length=3 → pin_mask=0x7.
+                # Using (int_count - 1) would give 0x3, which drops bit 2 and
+                # fails to match pin 4 (0b100 & 0b011 = 0).
+                pin_mask = (1 << int_count.bit_length()) - 1
                 intmask = (
                     self.pciFdtAddr(device=int_count - 1, addr=0)
-                    + [int_count - 1]
+                    + [pin_mask]
                 )
 
             node.append(FdtPropertyWords("interrupt-map", interrupts))
